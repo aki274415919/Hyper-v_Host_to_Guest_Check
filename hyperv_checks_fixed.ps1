@@ -20,9 +20,14 @@ param(
     [int[]]$Ports = @(3389, 5985), # RDP, WinRM
     [switch]$IncludeGuestChecks,
     [pscredential]$GuestCredential,
+    [pscredential]$HostCredential,
     [string]$CsvPath,
+    [string]$HtmlPath,
     [int]$PingCount = 1,
-    [int]$TcpTimeoutMs = 1000
+    [int]$TcpTimeoutMs = 1000,
+    [switch]$DnsFailureAsFail,
+    [switch]$NonInteractive,
+    [int]$ExpectedAccessVlanId
 )
 
 # ---------- UI Helpers (Popup) ----------
@@ -47,12 +52,14 @@ function Show-SaveFileDialog {
 # ---------- Input Logic ----------
 # 1. Ask for Hyper-V Host
 if (-not $HyperVHost) {
+    if ($NonInteractive) { Write-Error "-HyperVHost is required when -NonInteractive is used."; exit 1 }
     $HyperVHost = Show-InputBox -Title "Hyper-V Host" -Prompt "Enter Hostname (Keep empty for Localhost):" -Default $env:COMPUTERNAME
     if (-not $HyperVHost) { $HyperVHost = "localhost" }
 }
 
 # 2. Ask for VM Names
 if (-not $VMName -or $VMName.Count -eq 0) {
+    if ($NonInteractive) { Write-Error "-VMName is required when -NonInteractive is used."; exit 1 }
     $vmInput = Show-InputBox -Title "Target VMs" -Prompt "Enter VM names (comma separated):" -Default ""
     if (-not $vmInput) { Write-Error "No VM specified."; exit }
     $VMName = $vmInput.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
@@ -60,12 +67,18 @@ if (-not $VMName -or $VMName.Count -eq 0) {
 
 # 3. Ask for CSV Path
 if (-not $CsvPath) {
+    if ($NonInteractive) { Write-Error "-CsvPath is required when -NonInteractive is used."; exit 1 }
     $CsvPath = Show-SaveFileDialog -DefaultFileName ("HyperV_Check_{0:yyyyMMdd_HHmm}.csv" -f (Get-Date))
     if (-not $CsvPath) { Write-Error "No CSV path selected."; exit }
 }
 
+if (-not $HtmlPath) {
+    $HtmlPath = [System.IO.Path]::ChangeExtension($CsvPath, "html")
+}
+
 # 4. Ask for Guest Creds (Only if Deep Check is enabled)
 if ($IncludeGuestChecks -and -not $GuestCredential) {
+    if ($NonInteractive) { Write-Error "-GuestCredential is required when -NonInteractive is used with -IncludeGuestChecks."; exit 1 }
     $GuestCredential = Get-Credential -Message "Enter Admin Creds for Guest OS (PowerShell Direct)"
 }
 
@@ -75,9 +88,21 @@ $rowsOut = @()
 
 Write-Host ">>> Starting Analysis on host: $HyperVHost..." -ForegroundColor Cyan
 
+# Basic remoting precheck for clearer failure output
+try {
+    if ($HostCredential) {
+        Test-WSMan -ComputerName $HyperVHost -Credential $HostCredential -ErrorAction Stop | Out-Null
+    } else {
+        Test-WSMan -ComputerName $HyperVHost -ErrorAction Stop | Out-Null
+    }
+} catch {
+    Write-Error "WinRM precheck failed for host '$HyperVHost': $($_.Exception.Message)"
+    exit 1
+}
+
 # --- PART 1: Host-Side Checks (Remote ScriptBlock) ---
 $hostScript = {
-    param($VMNames, $Ports, $PingCount, $TcpTimeoutMs)
+    param($VMNames, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId)
 
     # Internal Helper: Get IPs ignoring IPv6 Link-Local
     function Get-CleanIPs {
@@ -106,12 +131,20 @@ $hostScript = {
 
         if ($vm.State -ne 'Running') { continue } # Skip rest if VM is off
 
-        # B. Integration Services (Heartbeat is critical)
-        $beat = Get-VMIntegrationService -VMName $vm.Name -Name "Heartbeat"
-        $result += [pscustomobject]@{
-            VM=$vm.Name; Check="IS:Heartbeat"
-            Status=(if($beat.PrimaryStatusDescription -eq 'OK'){"OK"}else{"FAIL"})
-            Detail="Heartbeat: $($beat.PrimaryStatusDescription)"
+        # B. Integration Services (expanded checks)
+        foreach ($isName in @("Heartbeat", "Time Synchronization", "Key-Value Pair Exchange", "Backup (volume checkpoint)")) {
+            $is = Get-VMIntegrationService -VMName $vm.Name -Name $isName -ErrorAction SilentlyContinue
+            if (-not $is) {
+                $result += [pscustomobject]@{ VM=$vm.Name; Check="IS:$isName"; Status="WARN"; Detail="Integration service not found" }
+                continue
+            }
+
+            $isStatus = if ($is.PrimaryStatusDescription -eq 'OK') { "OK" } else { "FAIL" }
+            $result += [pscustomobject]@{
+                VM=$vm.Name; Check="IS:$isName";
+                Status=$isStatus;
+                Detail="Enabled=$($is.Enabled); PrimaryStatus=$($is.PrimaryStatusDescription)"
+            }
         }
 
         # C. Network Adapters (Switch, VLAN, IP)
@@ -123,8 +156,26 @@ $hostScript = {
 
             # C2. VLAN Check (NEW FEATURE)
             $vlan = Get-VMNetworkAdapterVlan -VMNetworkAdapter $a
-            $vlanMsg = if ($vlan.OperationMode -eq "Access") { "Access VLAN $($vlan.AccessVlanId)" } else { "Trunk/Untagged" }
-            $result += [pscustomobject]@{ VM=$vm.Name; Check="NIC:$($a.Name):VLAN"; Status="OK"; Detail=$vlanMsg }
+            $vlanStatus = "WARN"
+            $vlanMsg = "Mode: $($vlan.OperationMode)"
+            if ($vlan.OperationMode -eq "Access") {
+                if ($vlan.AccessVlanId -gt 0) {
+                    $vlanStatus = "OK"
+                    $vlanMsg = "Access VLAN $($vlan.AccessVlanId)"
+
+                    if ($ExpectedAccessVlanId -gt 0 -and $vlan.AccessVlanId -ne $ExpectedAccessVlanId) {
+                        $vlanStatus = "FAIL"
+                        $vlanMsg = "Access VLAN mismatch. Current=$($vlan.AccessVlanId); Expected=$ExpectedAccessVlanId"
+                    }
+                } else {
+                    $vlanMsg = "Access mode with invalid VLAN ID: $($vlan.AccessVlanId)"
+                }
+            } elseif ($vlan.OperationMode -eq "Untagged") {
+                $vlanMsg = "Untagged network"
+            } elseif ($vlan.OperationMode -eq "Trunk") {
+                $vlanMsg = "Trunk mode; Native VLAN: $($vlan.NativeVlanId); Allowed: $($vlan.AllowedVlanIdList)"
+            }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check="NIC:$($a.Name):VLAN"; Status=$vlanStatus; Detail=$vlanMsg }
 
             # C3. IP Addresses
             $ips = Get-CleanIPs -Adapter $a
@@ -136,9 +187,9 @@ $hostScript = {
                 foreach ($ip in $ips) {
                     # Ping
                     if (Test-Connection -ComputerName $ip -Count $PingCount -Quiet) {
-                        $result += [pscustomobject]@{ VM=$vm.Name; Check="Ping:$ip"; Status="OK"; Detail="Ping Reply Received" }
+                        $result += [pscustomobject]@{ VM=$vm.Name; Check=("Ping:{0}" -f $ip); Status="OK"; Detail="Ping Reply Received" }
                     } else {
-                        $result += [pscustomobject]@{ VM=$vm.Name; Check="Ping:$ip"; Status="FAIL"; Detail="Request Timed Out (Check Firewall)" }
+                        $result += [pscustomobject]@{ VM=$vm.Name; Check=("Ping:{0}" -f $ip); Status="FAIL"; Detail="No ICMP reply (possible firewall/routing/ACL issue)" }
                     }
                     
                     # Port Check (e.g. 3389)
@@ -149,12 +200,12 @@ foreach ($p in $Ports) {
         # ConnectAsync + Wait avoids false "open" results from BeginConnect/WaitOne
         $task = $sock.ConnectAsync($ip, $p)
         if ($task.Wait($TcpTimeoutMs) -and $sock.Connected) {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$p"; Status="OK"; Detail="Port Open" }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="OK"; Detail="Port Open" }
         } else {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$p"; Status="WARN"; Detail="Port Closed/Filtered/Timeout" }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Port Closed/Filtered/Timeout" }
         }
     } catch {
-        $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$p"; Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
+        $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
     } finally {
         if ($sock) { $sock.Close(); $sock.Dispose() }
     }
@@ -167,14 +218,17 @@ foreach ($p in $Ports) {
 }
 
 # Run Host Checks
+$hostInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $hostScript; ArgumentList = @($VMName, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId); ErrorAction = 'Stop' }
+if ($HostCredential) { $hostInvokeArgs.Credential = $HostCredential }
+
 try {
-    $hostResults = Invoke-Command -ComputerName $HyperVHost -ScriptBlock $hostScript -ArgumentList @($VMName, $Ports, $PingCount, $TcpTimeoutMs) -ErrorAction Stop
+    $hostResults = Invoke-Command @hostInvokeArgs
     foreach ($r in $hostResults) {
         $rowsOut += [pscustomobject]@{ Target="Host"; VM=$r.VM; Check=$r.Check; Status=$r.Status; Detail=$r.Detail }
     }
 } catch {
-    Write-Error "Failed to connect to Hyper-V Host. Check permissions."
-    exit
+    Write-Error "Failed to connect to Hyper-V Host. $($_.Exception.Message)"
+    exit 1
 }
 
 
@@ -183,7 +237,7 @@ if ($IncludeGuestChecks -and $GuestCredential) {
     Write-Host ">>> Starting Guest Internal Analysis..." -ForegroundColor Cyan
     
     $guestDriver = {
-        param($VMNames, $Cred)
+        param($VMNames, $Cred, $DnsFailureAsFail)
         
         $results = @()
         foreach ($vm in $VMNames) {
@@ -265,7 +319,8 @@ if (-not $dnsServers) {
         # Fallback: confirm local DNS client service state (real fallback, not just a comment)
         $dnsSvc = Get-Service -Name "Dnscache" -ErrorAction SilentlyContinue
         $svcMsg = if ($dnsSvc) { "Dnscache=$($dnsSvc.Status)" } else { "Dnscache=Unknown" }
-        $localRes += [pscustomobject]@{ Check="Guest:DNS"; Status="WARN"; Detail="Resolution failed. $svcMsg. Details: $($dnsDetail -join '; ')" }
+        $dnsStatus = if ($DnsFailureAsFail) { "FAIL" } else { "WARN" }
+        $localRes += [pscustomobject]@{ Check="Guest:DNS"; Status=$dnsStatus; Detail="Resolution failed. $svcMsg. Details: $($dnsDetail -join '; ')" }
     }
 }
 
@@ -273,8 +328,13 @@ if (-not $dnsServers) {
 
                 foreach ($s in @("WinRM", "TermService", "LanmanServer")) {
                     $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+                    if (-not $svc) {
+                        $localRes += [pscustomobject]@{ Check="Guest:Service:$s"; Status="FAIL"; Detail="Service not found" }
+                        continue
+                    }
+
                     $st = if ($svc.Status -eq 'Running') { "OK" } else { "WARN" }
-                    $localRes += [pscustomobject]@{ Check="Guest:Service:$s"; Status=$st; Detail="State: $($svc.Status)" }
+                    $localRes += [pscustomobject]@{ Check="Guest:Service:$s"; Status=$st; Detail="State: $($svc.Status); StartType: $($svc.StartType)" }
                 }
 
                 return $localRes
@@ -294,12 +354,42 @@ if (-not $dnsServers) {
     }
 
     # Run the driver on the Host (Host triggers PSDirect to Guests)
-    $guestResults = Invoke-Command -ComputerName $HyperVHost -ScriptBlock $guestDriver -ArgumentList @($VMName, $GuestCredential)
+    $guestInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $guestDriver; ArgumentList = @($VMName, $GuestCredential, $DnsFailureAsFail) }
+    if ($HostCredential) { $guestInvokeArgs.Credential = $HostCredential }
+    $guestResults = Invoke-Command @guestInvokeArgs
     foreach ($r in $guestResults) {
         $rowsOut += [pscustomobject]@{ Target="Guest"; VM=$r.VM; Check=$r.Check; Status=$r.Status; Detail=$r.Detail }
     }
 }
 
 # ---------- Export ----------
-$rowsOut | Select-Object Target, VM, Check, Status, Detail | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-Write-Host "`n>>> Report Saved: $CsvPath" -ForegroundColor Green
+$exportRows = $rowsOut | Select-Object Target, VM, Check, Status, Detail
+$exportRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+
+$htmlHead = @"
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #d0d7de; padding: 8px; text-align: left; }
+th { background: #f6f8fa; }
+.OK { color: #1a7f37; font-weight: 600; }
+.WARN { color: #9a6700; font-weight: 600; }
+.FAIL { color: #cf222e; font-weight: 700; }
+</style>
+"@
+
+$htmlRows = foreach ($row in $exportRows) {
+    [pscustomobject]@{
+        Target = $row.Target
+        VM = $row.VM
+        Check = $row.Check
+        Status = "<span class='$($row.Status)'>$($row.Status)</span>"
+        Detail = $row.Detail
+    }
+}
+
+$htmlTitle = "Hyper-V Host/Guest Diagnostics - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$htmlRows | ConvertTo-Html -Title $htmlTitle -Head $htmlHead | Out-File -FilePath $HtmlPath -Encoding UTF8
+
+Write-Host "`n>>> Report Saved (CSV): $CsvPath" -ForegroundColor Green
+Write-Host ">>> Report Saved (HTML): $HtmlPath" -ForegroundColor Green
