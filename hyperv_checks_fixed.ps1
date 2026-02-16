@@ -26,8 +26,10 @@ param(
     [int]$PingCount = 1,
     [int]$TcpTimeoutMs = 1000,
     [switch]$DnsFailureAsFail,
+    [string]$DnsTestName,
     [switch]$NonInteractive,
-    [int]$ExpectedAccessVlanId
+    [int]$ExpectedAccessVlanId,
+    [string]$ExpectedTrunkAllowedVlanList
 )
 
 # ---------- UI Helpers (Popup) ----------
@@ -102,13 +104,13 @@ try {
 
 # --- PART 1: Host-Side Checks (Remote ScriptBlock) ---
 $hostScript = {
-    param($VMNames, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId)
+    param($VMNames, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId, $ExpectedTrunkAllowedVlanList)
 
     # Internal Helper: Get IPs ignoring IPv6 Link-Local
     function Get-CleanIPs {
         param($Adapter)
         if ($Adapter.IPAddresses) {
-            return $Adapter.IPAddresses | Where-Object { $_ -notmatch '^fe80:' -and $_ -ne '0.0.0.0' }
+            return $Adapter.IPAddresses | Where-Object { $_ -notmatch '^fe80:' -and $_ -ne '0.0.0.0' -and $_ -notlike '169.254.*' }
         }
         return @()
     }
@@ -123,27 +125,29 @@ $hostScript = {
         }
 
         # A. VM State
-        $result += [pscustomobject]@{ 
-            VM=$vm.Name; Check="VM:State"; 
-            Status=(if($vm.State -eq 'Running'){"OK"}else{"FAIL"}); 
-            Detail="State: $($vm.State)" 
+        $stateStatus = if ($vm.State -eq 'Running') { "OK" } else { "FAIL" }
+        $result += [pscustomobject]@{
+            VM = $vm.Name
+            Check = "VM:State"
+            Status = $stateStatus
+            Detail = "State: $($vm.State)"
         }
 
         if ($vm.State -ne 'Running') { continue } # Skip rest if VM is off
 
-        # B. Integration Services (expanded checks)
-        foreach ($isName in @("Heartbeat", "Time Synchronization", "Key-Value Pair Exchange", "Backup (volume checkpoint)")) {
-            $is = Get-VMIntegrationService -VMName $vm.Name -Name $isName -ErrorAction SilentlyContinue
-            if (-not $is) {
-                $result += [pscustomobject]@{ VM=$vm.Name; Check="IS:$isName"; Status="WARN"; Detail="Integration service not found" }
-                continue
-            }
-
-            $isStatus = if ($is.PrimaryStatusDescription -eq 'OK') { "OK" } else { "FAIL" }
-            $result += [pscustomobject]@{
-                VM=$vm.Name; Check="IS:$isName";
-                Status=$isStatus;
-                Detail="Enabled=$($is.Enabled); PrimaryStatus=$($is.PrimaryStatusDescription)"
+        # B. Integration Services (use full list to avoid name mismatches across versions)
+        $allIS = Get-VMIntegrationService -VMName $vm.Name -ErrorAction SilentlyContinue
+        if (-not $allIS) {
+            $result += [pscustomobject]@{ VM=$vm.Name; Check="IS:All"; Status="WARN"; Detail="No integration service data returned" }
+        } else {
+            foreach ($is in $allIS) {
+                $isStatus = if ($is.Enabled -and $is.PrimaryStatusDescription -eq 'OK') { "OK" } else { "WARN" }
+                $result += [pscustomobject]@{
+                    VM = $vm.Name
+                    Check = ("IS:{0}" -f $is.Name)
+                    Status = $isStatus
+                    Detail = "Enabled=$($is.Enabled); PrimaryStatus=$($is.PrimaryStatusDescription)"
+                }
             }
         }
 
@@ -173,14 +177,24 @@ $hostScript = {
             } elseif ($vlan.OperationMode -eq "Untagged") {
                 $vlanMsg = "Untagged network"
             } elseif ($vlan.OperationMode -eq "Trunk") {
+                $vlanStatus = "OK"
                 $vlanMsg = "Trunk mode; Native VLAN: $($vlan.NativeVlanId); Allowed: $($vlan.AllowedVlanIdList)"
+                if ($ExpectedTrunkAllowedVlanList) {
+                    $actualAllowed = (($vlan.AllowedVlanIdList -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ','
+                    $expectedAllowed = (($ExpectedTrunkAllowedVlanList -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ','
+                    if ($actualAllowed -ne $expectedAllowed) {
+                        $vlanStatus = "FAIL"
+                        $vlanMsg = "Trunk allowed VLAN mismatch. Current=$actualAllowed; Expected=$expectedAllowed"
+                    }
+                }
             }
             $result += [pscustomobject]@{ VM=$vm.Name; Check="NIC:$($a.Name):VLAN"; Status=$vlanStatus; Detail=$vlanMsg }
 
             # C3. IP Addresses
             $ips = Get-CleanIPs -Adapter $a
             $ipStatus = if ($ips.Count -gt 0) { "OK" } else { "WARN" }
-            $result += [pscustomobject]@{ VM=$vm.Name; Check="NIC:$($a.Name):IP"; Status=$ipStatus; Detail=($ips -join ", ") }
+            $ipDetail = if ($ips.Count -gt 0) { ($ips -join ", ") } else { "No IP reported by Hyper-V (integration services may be missing)" }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check="NIC:$($a.Name):IP"; Status=$ipStatus; Detail=$ipDetail }
             
             # C4. Ping & Port Test (Host -> Guest)
             if ($ips) {
@@ -193,23 +207,32 @@ $hostScript = {
                     }
                     
                     # Port Check (e.g. 3389)
-foreach ($p in $Ports) {
-    $sock = $null
-    try {
-        $sock = New-Object System.Net.Sockets.TcpClient
-        # ConnectAsync + Wait avoids false "open" results from BeginConnect/WaitOne
-        $task = $sock.ConnectAsync($ip, $p)
-        if ($task.Wait($TcpTimeoutMs) -and $sock.Connected) {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="OK"; Detail="Port Open" }
-        } else {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Port Closed/Filtered/Timeout" }
-        }
-    } catch {
-        $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
-    } finally {
-        if ($sock) { $sock.Close(); $sock.Dispose() }
-    }
-}
+                    foreach ($p in $Ports) {
+                        $sock = $null
+                        try {
+                            $sock = New-Object System.Net.Sockets.TcpClient
+                            $task = $sock.ConnectAsync($ip, $p)
+                            if ($task.Wait($TcpTimeoutMs) -and $sock.Connected) {
+                                $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="OK"; Detail="Port Open" }
+                            } elseif (-not $task.IsCompleted) {
+                                $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Port Timeout (path/ACL/routing issue likely)" }
+                            } else {
+                                $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Port Closed/Filtered" }
+                            }
+                        } catch [System.Net.Sockets.SocketException] {
+                            $socketCode = $_.Exception.SocketErrorCode
+                            $socketDetail = if ($socketCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused) {
+                                "Connection Refused (target reachable, service/host firewall denied)"
+                            } else {
+                                "Socket Error: $socketCode"
+                            }
+                            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail=$socketDetail }
+                        } catch {
+                            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
+                        } finally {
+                            if ($sock) { $sock.Close(); $sock.Dispose() }
+                        }
+                    }
 }
             }
         }
@@ -218,7 +241,7 @@ foreach ($p in $Ports) {
 }
 
 # Run Host Checks
-$hostInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $hostScript; ArgumentList = @($VMName, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId); ErrorAction = 'Stop' }
+$hostInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $hostScript; ArgumentList = @($VMName, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId, $ExpectedTrunkAllowedVlanList); ErrorAction = 'Stop' }
 if ($HostCredential) { $hostInvokeArgs.Credential = $HostCredential }
 
 try {
@@ -237,12 +260,13 @@ if ($IncludeGuestChecks -and $GuestCredential) {
     Write-Host ">>> Starting Guest Internal Analysis..." -ForegroundColor Cyan
     
     $guestDriver = {
-        param($VMNames, $Cred, $DnsFailureAsFail)
+        param($VMNames, $Cred, $DnsFailureAsFail, $DnsTestName)
         
         $results = @()
         foreach ($vm in $VMNames) {
             # The script block to run INSIDE the Guest
             $innerScript = {
+                param($DnsFailureAsFail, $DnsTestName)
                 $localRes = @()
                 
                 # G1. Firewall Profile (Better signal: "disabled" is the risky state)
@@ -284,11 +308,15 @@ if ($defRoute) {
 $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses |
     Where-Object { $_ -and $_ -ne '0.0.0.0' } | Select-Object -Unique
 
-# Pick a "safe" name to resolve (prefer internal domain if available)
+# Prefer FQDN targets; allow explicit override
 $testNames = @()
-if ($env:USERDNSDOMAIN) { $testNames += $env:USERDNSDOMAIN }
-if ($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME) { $testNames += $env:USERDOMAIN }
-if (-not $testNames) { $testNames += $env:COMPUTERNAME }
+if ($DnsTestName) { $testNames += $DnsTestName }
+if ($env:USERDNSDOMAIN) {
+    $testNames += $env:USERDNSDOMAIN
+    $testNames += ("{0}.{1}" -f $env:COMPUTERNAME, $env:USERDNSDOMAIN)
+}
+$testNames += "localhost"
+$testNames = $testNames | Where-Object { $_ } | Select-Object -Unique
 
 $dnsOk = $false
 $dnsDetail = @()
@@ -298,31 +326,44 @@ if (-not $dnsServers) {
 } else {
     foreach ($server in $dnsServers) {
         $serverReach = Test-Connection -ComputerName $server -Count 1 -Quiet -ErrorAction SilentlyContinue
+        $icmpState = if ($serverReach) { "ICMP=OK" } else { "ICMP=FAIL" }
+
         foreach ($name in $testNames) {
             try {
-                # -Server makes sure we are testing the configured DNS, not random upstream behavior
                 Resolve-DnsName -Name $name -Server $server -QuickTimeout -ErrorAction Stop | Out-Null
                 $dnsOk = $true
-                $dnsDetail += "$server OK ($name)"
+                $dnsDetail += ("{0} {1}; DNS=OK ({2})" -f $server, $icmpState, $name)
                 break
             } catch {
-                $dnsDetail += "$server FAIL ($name)"
+                $dnsDetail += ("{0} {1}; DNS=FAIL ({2})" -f $server, $icmpState, $name)
             }
         }
+
         if ($dnsOk) { break }
-        if (-not $serverReach) { $dnsDetail += "$server unreachable (ICMP)" }
     }
 
     if ($dnsOk) {
         $localRes += [pscustomobject]@{ Check="Guest:DNS"; Status="OK"; Detail=($dnsDetail -join '; ') }
     } else {
-        # Fallback: confirm local DNS client service state (real fallback, not just a comment)
         $dnsSvc = Get-Service -Name "Dnscache" -ErrorAction SilentlyContinue
         $svcMsg = if ($dnsSvc) { "Dnscache=$($dnsSvc.Status)" } else { "Dnscache=Unknown" }
         $dnsStatus = if ($DnsFailureAsFail) { "FAIL" } else { "WARN" }
         $localRes += [pscustomobject]@{ Check="Guest:DNS"; Status=$dnsStatus; Detail="Resolution failed. $svcMsg. Details: $($dnsDetail -join '; ')" }
     }
 }
+
+# G5. Firewall rules for remote access explainability
+$rdpRules = Get-NetFirewallRule -DisplayGroup "Remote Desktop" -Enabled True -ErrorAction SilentlyContinue
+$rdpRuleOk = $rdpRules -ne $null
+$rdpStatus = if ($rdpRuleOk) { "OK" } else { "WARN" }
+$rdpDetail = if ($rdpRuleOk) { "Enabled inbound Remote Desktop rules found" } else { "No enabled Remote Desktop firewall rules" }
+$localRes += [pscustomobject]@{ Check="Guest:Firewall:RDP"; Status=$rdpStatus; Detail=$rdpDetail }
+
+$winrmRules = Get-NetFirewallRule -DisplayName "*WINRM*" -Enabled True -ErrorAction SilentlyContinue
+$winrmRuleOk = $winrmRules -ne $null
+$winrmStatus = if ($winrmRuleOk) { "OK" } else { "WARN" }
+$winrmDetail = if ($winrmRuleOk) { "Enabled WinRM firewall rules found" } else { "No enabled WinRM firewall rules" }
+$localRes += [pscustomobject]@{ Check="Guest:Firewall:WinRM"; Status=$winrmStatus; Detail=$winrmDetail }
 
 # G5. Key Services
 
@@ -342,19 +383,19 @@ if (-not $dnsServers) {
 
             try {
                 # Invoke via PowerShell Direct (VMName parameter implies VMBus)
-                $guestData = Invoke-Command -VMName $vm -Credential $Cred -ScriptBlock $innerScript -ErrorAction Stop
+                $guestData = Invoke-Command -VMName $vm -Credential $Cred -ScriptBlock $innerScript -ArgumentList @($DnsFailureAsFail, $DnsTestName) -ErrorAction Stop
                 foreach ($g in $guestData) {
                     $results += [pscustomobject]@{ VM=$vm; Check=$g.Check; Status=$g.Status; Detail=$g.Detail }
                 }
             } catch {
-                $results += [pscustomobject]@{ VM=$vm; Check="Guest:Connection"; Status="FAIL"; Detail="PSDirect Failed: $($_.Exception.Message)" }
+                $results += [pscustomobject]@{ VM=$vm; Check="Guest:Connection"; Status="FAIL"; Detail="PSDirect Failed: $($_.Exception.Message). Hint: Run on Hyper-V host directly or ensure remote session is elevated and Hyper-V module is available." }
             }
         }
         return $results
     }
 
     # Run the driver on the Host (Host triggers PSDirect to Guests)
-    $guestInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $guestDriver; ArgumentList = @($VMName, $GuestCredential, $DnsFailureAsFail) }
+    $guestInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $guestDriver; ArgumentList = @($VMName, $GuestCredential, $DnsFailureAsFail, $DnsTestName) }
     if ($HostCredential) { $guestInvokeArgs.Credential = $HostCredential }
     $guestResults = Invoke-Command @guestInvokeArgs
     foreach ($r in $guestResults) {
@@ -383,7 +424,7 @@ $htmlRows = foreach ($row in $exportRows) {
         Target = $row.Target
         VM = $row.VM
         Check = $row.Check
-        Status = "<span class='$($row.Status)'>$($row.Status)</span>"
+        Status = $row.Status
         Detail = $row.Detail
     }
 }
