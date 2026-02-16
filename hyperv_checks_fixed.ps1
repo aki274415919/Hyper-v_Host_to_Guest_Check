@@ -90,11 +90,7 @@ Write-Host ">>> Starting Analysis on host: $HyperVHost..." -ForegroundColor Cyan
 
 # Basic remoting precheck for clearer failure output
 try {
-    if ($HostCredential) {
-        Test-WSMan -ComputerName $HyperVHost -Credential $HostCredential -ErrorAction Stop | Out-Null
-    } else {
-        Test-WSMan -ComputerName $HyperVHost -ErrorAction Stop | Out-Null
-    }
+    Test-WSMan -ComputerName $HyperVHost -ErrorAction Stop | Out-Null
 } catch {
     Write-Error "WinRM precheck failed for host '$HyperVHost': $($_.Exception.Message)"
     exit 1
@@ -200,12 +196,12 @@ foreach ($p in $Ports) {
         # ConnectAsync + Wait avoids false "open" results from BeginConnect/WaitOne
         $task = $sock.ConnectAsync($ip, $p)
         if ($task.Wait($TcpTimeoutMs) -and $sock.Connected) {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="OK"; Detail="Port Open" }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$ip:$p"; Status="OK"; Detail="Port Open" }
         } else {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Port Closed/Filtered/Timeout" }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$ip:$p"; Status="WARN"; Detail="Port Closed/Filtered/Timeout" }
         }
     } catch {
-        $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
+        $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$ip:$p"; Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
     } finally {
         if ($sock) { $sock.Close(); $sock.Dispose() }
     }
@@ -222,7 +218,7 @@ $hostInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $hostScript; Argu
 if ($HostCredential) { $hostInvokeArgs.Credential = $HostCredential }
 
 try {
-    $hostResults = Invoke-Command @hostInvokeArgs
+    $hostResults = Invoke-Command -ComputerName $HyperVHost -ScriptBlock $hostScript -ArgumentList @($VMName, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId) -ErrorAction Stop
     foreach ($r in $hostResults) {
         $rowsOut += [pscustomobject]@{ Target="Host"; VM=$r.VM; Check=$r.Check; Status=$r.Status; Detail=$r.Detail }
     }
@@ -354,42 +350,12 @@ if (-not $dnsServers) {
     }
 
     # Run the driver on the Host (Host triggers PSDirect to Guests)
-    $guestInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $guestDriver; ArgumentList = @($VMName, $GuestCredential, $DnsFailureAsFail) }
-    if ($HostCredential) { $guestInvokeArgs.Credential = $HostCredential }
-    $guestResults = Invoke-Command @guestInvokeArgs
+    $guestResults = Invoke-Command -ComputerName $HyperVHost -ScriptBlock $guestDriver -ArgumentList @($VMName, $GuestCredential, $DnsFailureAsFail)
     foreach ($r in $guestResults) {
         $rowsOut += [pscustomobject]@{ Target="Guest"; VM=$r.VM; Check=$r.Check; Status=$r.Status; Detail=$r.Detail }
     }
 }
 
 # ---------- Export ----------
-$exportRows = $rowsOut | Select-Object Target, VM, Check, Status, Detail
-$exportRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-
-$htmlHead = @"
-<style>
-body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; }
-table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #d0d7de; padding: 8px; text-align: left; }
-th { background: #f6f8fa; }
-.OK { color: #1a7f37; font-weight: 600; }
-.WARN { color: #9a6700; font-weight: 600; }
-.FAIL { color: #cf222e; font-weight: 700; }
-</style>
-"@
-
-$htmlRows = foreach ($row in $exportRows) {
-    [pscustomobject]@{
-        Target = $row.Target
-        VM = $row.VM
-        Check = $row.Check
-        Status = "<span class='$($row.Status)'>$($row.Status)</span>"
-        Detail = $row.Detail
-    }
-}
-
-$htmlTitle = "Hyper-V Host/Guest Diagnostics - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-$htmlRows | ConvertTo-Html -Title $htmlTitle -Head $htmlHead | Out-File -FilePath $HtmlPath -Encoding UTF8
-
-Write-Host "`n>>> Report Saved (CSV): $CsvPath" -ForegroundColor Green
-Write-Host ">>> Report Saved (HTML): $HtmlPath" -ForegroundColor Green
+$rowsOut | Select-Object Target, VM, Check, Status, Detail | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+Write-Host "`n>>> Report Saved: $CsvPath" -ForegroundColor Green
