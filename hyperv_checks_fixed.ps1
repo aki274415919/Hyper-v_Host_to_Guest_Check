@@ -190,12 +190,12 @@ foreach ($p in $Ports) {
         # ConnectAsync + Wait avoids false "open" results from BeginConnect/WaitOne
         $task = $sock.ConnectAsync($ip, $p)
         if ($task.Wait($TcpTimeoutMs) -and $sock.Connected) {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="OK"; Detail="Port Open" }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$ip:$p"; Status="OK"; Detail="Port Open" }
         } else {
-            $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Port Closed/Filtered/Timeout" }
+            $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$ip:$p"; Status="WARN"; Detail="Port Closed/Filtered/Timeout" }
         }
     } catch {
-        $result += [pscustomobject]@{ VM=$vm.Name; Check=("Port:{0}:{1}" -f $ip, $p); Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
+        $result += [pscustomobject]@{ VM=$vm.Name; Check="Port:$ip:$p"; Status="WARN"; Detail="Connect Error: $($_.Exception.Message)" }
     } finally {
         if ($sock) { $sock.Close(); $sock.Dispose() }
     }
