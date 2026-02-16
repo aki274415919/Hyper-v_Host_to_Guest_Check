@@ -20,7 +20,9 @@ param(
     [int[]]$Ports = @(3389, 5985), # RDP, WinRM
     [switch]$IncludeGuestChecks,
     [pscredential]$GuestCredential,
+    [pscredential]$HostCredential,
     [string]$CsvPath,
+    [string]$HtmlPath,
     [int]$PingCount = 1,
     [int]$TcpTimeoutMs = 1000,
     [switch]$DnsFailureAsFail,
@@ -68,6 +70,10 @@ if (-not $CsvPath) {
     if ($NonInteractive) { Write-Error "-CsvPath is required when -NonInteractive is used."; exit 1 }
     $CsvPath = Show-SaveFileDialog -DefaultFileName ("HyperV_Check_{0:yyyyMMdd_HHmm}.csv" -f (Get-Date))
     if (-not $CsvPath) { Write-Error "No CSV path selected."; exit }
+}
+
+if (-not $HtmlPath) {
+    $HtmlPath = [System.IO.Path]::ChangeExtension($CsvPath, "html")
 }
 
 # 4. Ask for Guest Creds (Only if Deep Check is enabled)
@@ -208,14 +214,17 @@ foreach ($p in $Ports) {
 }
 
 # Run Host Checks
+$hostInvokeArgs = @{ ComputerName = $HyperVHost; ScriptBlock = $hostScript; ArgumentList = @($VMName, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId); ErrorAction = 'Stop' }
+if ($HostCredential) { $hostInvokeArgs.Credential = $HostCredential }
+
 try {
     $hostResults = Invoke-Command -ComputerName $HyperVHost -ScriptBlock $hostScript -ArgumentList @($VMName, $Ports, $PingCount, $TcpTimeoutMs, $ExpectedAccessVlanId) -ErrorAction Stop
     foreach ($r in $hostResults) {
         $rowsOut += [pscustomobject]@{ Target="Host"; VM=$r.VM; Check=$r.Check; Status=$r.Status; Detail=$r.Detail }
     }
 } catch {
-    Write-Error "Failed to connect to Hyper-V Host. Check permissions."
-    exit
+    Write-Error "Failed to connect to Hyper-V Host. $($_.Exception.Message)"
+    exit 1
 }
 
 
