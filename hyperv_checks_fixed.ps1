@@ -84,6 +84,10 @@ if ($IncludeGuestChecks -and -not $GuestCredential) {
     $GuestCredential = Get-Credential -Message "Enter Admin Creds for Guest OS (PowerShell Direct)"
 }
 
+if (-not $HostCredential -and -not $NonInteractive -and $HyperVHost -ne "localhost" -and $HyperVHost -ne "." -and $HyperVHost -ne $env:COMPUTERNAME) {
+    $HostCredential = Get-Credential -Message "Optional: Enter credential for Hyper-V Host remoting (Cancel to use current user)"
+}
+
 # ---------- Main Logic ----------
 $now = Get-Date
 $rowsOut = @()
@@ -180,11 +184,12 @@ $hostScript = {
                 $vlanStatus = "OK"
                 $vlanMsg = "Trunk mode; Native VLAN: $($vlan.NativeVlanId); Allowed: $($vlan.AllowedVlanIdList)"
                 if ($ExpectedTrunkAllowedVlanList) {
-                    $actualAllowed = (($vlan.AllowedVlanIdList -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ','
-                    $expectedAllowed = (($ExpectedTrunkAllowedVlanList -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ','
-                    if ($actualAllowed -ne $expectedAllowed) {
+                    $actualAllowed = @($vlan.AllowedVlanIdList -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+                    $expectedAllowed = @($ExpectedTrunkAllowedVlanList -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+                    $diff = Compare-Object -ReferenceObject $actualAllowed -DifferenceObject $expectedAllowed
+                    if ($diff) {
                         $vlanStatus = "FAIL"
-                        $vlanMsg = "Trunk allowed VLAN mismatch. Current=$actualAllowed; Expected=$expectedAllowed"
+                        $vlanMsg = "Trunk allowed VLAN mismatch. Current=$($actualAllowed -join ','); Expected=$($expectedAllowed -join ',')"
                     }
                 }
             }
@@ -233,7 +238,7 @@ $hostScript = {
                             if ($sock) { $sock.Close(); $sock.Dispose() }
                         }
                     }
-}
+                }
             }
         }
     }
@@ -325,17 +330,17 @@ if (-not $dnsServers) {
     $localRes += [pscustomobject]@{ Check="Guest:DNS"; Status="FAIL"; Detail="No DNS servers configured" }
 } else {
     foreach ($server in $dnsServers) {
-        $serverReach = Test-Connection -ComputerName $server -Count 1 -Quiet -ErrorAction SilentlyContinue
-        $icmpState = if ($serverReach) { "ICMP=OK" } else { "ICMP=FAIL" }
+        $dnsPortReach = Test-NetConnection -ComputerName $server -Port 53 -InformationLevel Quiet -WarningAction SilentlyContinue
+        $dnsPortState = if ($dnsPortReach) { "TCP53=OK" } else { "TCP53=FAIL (may still work via UDP)" }
 
         foreach ($name in $testNames) {
             try {
                 Resolve-DnsName -Name $name -Server $server -QuickTimeout -ErrorAction Stop | Out-Null
                 $dnsOk = $true
-                $dnsDetail += ("{0} {1}; DNS=OK ({2})" -f $server, $icmpState, $name)
+                $dnsDetail += ("{0} {1}; DNS=OK ({2})" -f $server, $dnsPortState, $name)
                 break
             } catch {
-                $dnsDetail += ("{0} {1}; DNS=FAIL ({2})" -f $server, $icmpState, $name)
+                $dnsDetail += ("{0} {1}; DNS=FAIL ({2})" -f $server, $dnsPortState, $name)
             }
         }
 
@@ -388,7 +393,7 @@ $localRes += [pscustomobject]@{ Check="Guest:Firewall:WinRM"; Status=$winrmStatu
                     $results += [pscustomobject]@{ VM=$vm; Check=$g.Check; Status=$g.Status; Detail=$g.Detail }
                 }
             } catch {
-                $results += [pscustomobject]@{ VM=$vm; Check="Guest:Connection"; Status="FAIL"; Detail="PSDirect Failed: $($_.Exception.Message). Hint: Run on Hyper-V host directly or ensure remote session is elevated and Hyper-V module is available." }
+                $results += [pscustomobject]@{ VM=$vm; Check="Guest:Connection"; Status="FAIL"; Detail="PSDirect Failed: $($_.Exception.Message). Hint: Run on Hyper-V host directly or ensure remote session is elevated with Hyper-V module; VM must be Running and guest credentials valid; host user must be authorized for the VM (e.g., Hyper-V Administrators)." }
             }
         }
         return $results
